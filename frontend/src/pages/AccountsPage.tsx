@@ -121,6 +121,8 @@ export function AccountsPage() {
   const [detailInitialTab, setDetailInitialTab] = useState<DetailTab>('overview')
   const [deleteTarget, setDeleteTarget] = useState<Account | null>(null)
   const [search, setSearch] = useState('')
+  type StatusFilter = 'all' | 'online' | 'active' | 'suspended' | 'expired'
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
 
   const accountsQuery = useQuery({
     queryKey: ['accounts'],
@@ -139,9 +141,27 @@ export function AccountsPage() {
   const nodes = nodesQuery.data?.nodes ?? []
 
   const query = search.trim().toLowerCase()
-  const filteredAccounts = query
-    ? accounts.filter((a) => a.label.toLowerCase().includes(query) || a.external_ref?.toLowerCase().includes(query))
-    : accounts
+  const filteredAccounts = accounts.filter((a) => {
+    const matchesSearch = !query || a.label.toLowerCase().includes(query) || a.external_ref?.toLowerCase().includes(query) || a.id.toLowerCase().includes(query)
+    if (!matchesSearch) return false
+
+    if (statusFilter === 'online') {
+      return a.peers.some((p) => p.online)
+    }
+    if (statusFilter === 'active') {
+      return a.status === 'active'
+    }
+    if (statusFilter === 'suspended') {
+      return a.status === 'suspended'
+    }
+    if (statusFilter === 'expired') {
+      return a.status === 'expired'
+    }
+    return true
+  })
+
+  const onlineCount = accounts.filter((a) => a.peers.some((p) => p.online)).length
+  const suspendedCount = accounts.filter((a) => a.status === 'suspended').length
 
   function openDetail(account: Account, tab: DetailTab = 'overview') {
     setDetailInitialTab(tab)
@@ -232,15 +252,66 @@ export function AccountsPage() {
       />
 
       {accounts.length > 0 && (
-        <div className="relative mb-4 max-w-xs">
-          <Search className="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-faint" />
-          <Input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search accounts…"
-            className="pl-9"
-            aria-label="Search accounts"
-          />
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div className="relative w-full max-w-xs">
+            <Search className="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-faint" />
+            <Input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search accounts or ID…"
+              className="pl-9"
+              aria-label="Search accounts"
+            />
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-border bg-card p-1 text-xs">
+            <button
+              type="button"
+              onClick={() => setStatusFilter('all')}
+              className={`rounded-md px-3 py-1.5 font-medium transition-colors ${
+                statusFilter === 'all' ? 'bg-primary text-primary-fg shadow-sm' : 'text-muted hover:text-fg'
+              }`}
+            >
+              All ({accounts.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setStatusFilter('online')}
+              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 font-medium transition-colors ${
+                statusFilter === 'online' ? 'bg-emerald-600 text-white shadow-sm' : 'text-emerald-600 dark:text-emerald-400 hover:text-fg'
+              }`}
+            >
+              <span className="h-2 w-2 rounded-full bg-emerald-400"></span>
+              Online ({onlineCount})
+            </button>
+            <button
+              type="button"
+              onClick={() => setStatusFilter('active')}
+              className={`rounded-md px-3 py-1.5 font-medium transition-colors ${
+                statusFilter === 'active' ? 'bg-primary text-primary-fg shadow-sm' : 'text-muted hover:text-fg'
+              }`}
+            >
+              Active
+            </button>
+            <button
+              type="button"
+              onClick={() => setStatusFilter('suspended')}
+              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 font-medium transition-colors ${
+                statusFilter === 'suspended' ? 'bg-amber-600 text-white shadow-sm' : 'text-amber-600 dark:text-amber-400 hover:text-fg'
+              }`}
+            >
+              Suspended ({suspendedCount})
+            </button>
+            <button
+              type="button"
+              onClick={() => setStatusFilter('expired')}
+              className={`rounded-md px-3 py-1.5 font-medium transition-colors ${
+                statusFilter === 'expired' ? 'bg-rose-600 text-white shadow-sm' : 'text-rose-600 dark:text-rose-400 hover:text-fg'
+              }`}
+            >
+              Expired
+            </button>
+          </div>
         </div>
       )}
 
