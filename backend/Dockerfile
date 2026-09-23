@@ -18,7 +18,9 @@ RUN mkdir -p /out/data && chown 65532:65532 /out/data
 
 # Runtime base pinned to a digest (resolved from :nonroot) so the shipped image is
 # reproducible and can't drift under an unattended CI rebuild - bump deliberately.
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:aef9602f8710ec12bde19d593fed1f76c708531bb7aba205110f1029786ead7b
+FROM alpine:3.20
+RUN adduser -D -u 65532 nonroot
+USER nonroot
 COPY --from=build /out/wgpanel-api /wgpanel-api
 COPY --from=build /out/wgpanel-agent /wgpanel-agent
 COPY --from=build --chown=65532:65532 /out/data /data
