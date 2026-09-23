@@ -466,6 +466,13 @@ func (s *Store) reconcileExpiry(ctx context.Context) error {
 		UPDATE accounts SET status = 'suspended', suspend_reason = 'expired', updated_at = now()
 		WHERE status = 'active' AND expiry_at IS NOT NULL AND expiry_at <= now()
 	`)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx, `
+		UPDATE accounts SET status = 'suspended', suspend_reason = 'quota_exceeded', updated_at = now()
+		WHERE status = 'active' AND data_quota_bytes IS NOT NULL AND data_used_bytes >= data_quota_bytes
+	`)
 	return err
 }
 

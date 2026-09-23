@@ -244,6 +244,12 @@ func ingestPeerTraffic(ctx context.Context, tx pgx.Tx, nodeID string, traffic []
 			WHERE a.id = v.account_id
 		`, accountIDs, deltas); err != nil {
 			return nil, err
+		if _, err := tx.Exec(ctx, `
+			UPDATE accounts SET status = 'suspended', suspend_reason = 'quota_exceeded', updated_at = now()
+			WHERE status = 'active' AND data_quota_bytes IS NOT NULL AND data_used_bytes >= data_quota_bytes
+		`); err != nil {
+			return nil, err
+		}
 		}
 	}
 
