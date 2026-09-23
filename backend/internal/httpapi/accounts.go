@@ -307,9 +307,9 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
-	limit := 50
+	limit := 10000
 	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 10000 {
 			limit = n
 		}
 	}
