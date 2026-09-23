@@ -270,6 +270,7 @@ export function AccountsPage() {
             <THead>
               <tr>
                 <Th>Label</Th>
+                <Th>ID</Th>
                 <Th>Nodes</Th>
                 <Th>Connection</Th>
                 <Th>Usage</Th>
@@ -288,6 +289,9 @@ export function AccountsPage() {
                 return (
                   <Tr key={a.id} interactive onClick={() => openDetail(a)}>
                     <Td className="font-medium text-fg">{a.label}</Td>
+                    <Td className="font-mono text-xs text-muted cursor-pointer hover:text-fg" title="Click to copy ID" onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(a.id); push('success', 'ID copied'); }}>
+                      {a.id.slice(0, 8)}...
+                    </Td>
                     <Td className="text-muted">
                       <span className="inline-flex items-center gap-1.5">
                         <Server className="h-3.5 w-3.5 text-faint" />
