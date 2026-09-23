@@ -11,6 +11,7 @@ import (
 )
 
 var (
+	ErrLabelTaken           = errors.New("label already exists in this namespace")
 	ErrExternalRefTaken     = errors.New("external_ref already exists")
 	ErrAccountNotFound      = errors.New("account not found")
 	ErrNodeNotRegistered    = errors.New("node is not registered")
@@ -188,6 +189,20 @@ func (s *Store) CreateAccount(ctx context.Context, p CreateAccountParams) (Accou
 		if len(nodes) == 0 {
 			return Account{}, ErrNoAvailableNode
 		}
+	}
+
+	// Uniqueness check for label within the caller's namespace
+	var labelExists bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM accounts
+			WHERE COALESCE(owner_key_namespace, '') = COALESCE($1, '')
+			  AND label = $2
+		)`, p.OwnerKeyNamespace, p.Label).Scan(&labelExists); err != nil {
+		return Account{}, err
+	}
+	if labelExists {
+		return Account{}, ErrLabelTaken
 	}
 
 	var a Account

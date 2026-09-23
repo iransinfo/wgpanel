@@ -290,6 +290,9 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrNoAvailableNode):
 		writeJSONError(w, http.StatusConflict, "no_available_node", "no registered node has remaining capacity")
 		return
+	case errors.Is(err, store.ErrLabelTaken):
+		writeJSONError(w, http.StatusConflict, "label_taken", "an account with this label already exists in this namespace")
+		return
 	case errors.Is(err, store.ErrExternalRefTaken):
 		writeJSONError(w, http.StatusConflict, "external_ref_taken", "an account with this external_ref already exists")
 		return
