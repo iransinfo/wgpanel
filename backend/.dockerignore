@@ -1,0 +1,18 @@
+# Keep the build context small and free of host-only cruft. The Dockerfile does
+# `COPY . .`, so without this the whole .git history, editor files, and any local
+# build output would be shipped into the build layer.
+.git
+.gitignore
+.dockerignore
+Dockerfile
+*.md
+# Local build artifacts / binaries (the image builds its own inside the container).
+/wgpanel-api
+/wgpanel-agent
+*.test
+*.out
+coverage*
+# Editor / OS noise
+.idea
+.vscode
+.DS_Store

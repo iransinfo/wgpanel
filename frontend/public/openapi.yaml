@@ -1,0 +1,1863 @@
+openapi: 3.0.3
+info:
+  title: WGPanel API
+  description: |
+    WGPanel manages WireGuard nodes and peer ("account") provisioning behind a
+    separate Telegram sales bot. This panel deliberately has **no concept of
+    payments, pricing, or plans** — the bot owns all of that and talks to this
+    API using a scoped, HMAC-signed API key. Admin/operator users manage the
+    same resources through the same endpoints using a JWT session instead.
+
+    ## Authentication
+
+    Every endpoint under `/api/v1/*` (except `POST /api/v1/auth/login`,
+    `POST /api/v1/auth/refresh`, and `POST /api/v1/nodes/join`) requires
+    **one** of:
+
+    - **Admin session** — `Authorization: Bearer <access_token>` from
+      `POST /api/v1/auth/login`. Access tokens are short-lived (15 minutes);
+      exchange the refresh token via `POST /api/v1/auth/refresh` before it
+      expires. Admin sessions are additionally subject to role checks
+      (`support` < `operator` < `super_admin`) documented per-operation below.
+    - **Bot/reseller API key** — three headers together:
+      `X-API-Key` (the key ID), `X-Timestamp` (unix seconds), and
+      `X-Signature` (hex HMAC-SHA256). The signed payload is exactly:
+
+      ```
+      {METHOD}\n{URL_PATH}\n{TIMESTAMP}\n{RAW_BODY}
+      ```
+
+      `METHOD` is the uppercase HTTP verb, `URL_PATH` is the request path
+      with no query string, `TIMESTAMP` is the literal `X-Timestamp` header
+      value (not re-serialized), and `RAW_BODY` is the exact request body
+      bytes (empty string for bodyless requests). Compute the HMAC with the
+      API key's secret (returned **once**, at creation or rotation time) and
+      hex-encode it. Requests outside a ±5 minute timestamp window are
+      rejected regardless of signature validity. API keys carry their own
+      `permissions` (a subset of `read`/`create`/`update`/`suspend`/`delete`)
+      and `node_groups` scoping (empty = unrestricted).
+
+    These two mechanisms are mutually exclusive per request — the server
+    checks for a non-empty `Authorization` header first and, if absent, falls
+    back to the three `X-*` headers.
+
+    ## Error format
+
+    Every error response, from every endpoint, uses exactly this envelope:
+
+    ```json
+    { "error": { "code": "account_not_found", "message": "no account with that id" } }
+    ```
+
+    `code` is a stable machine-readable string (see the shared
+    `ErrorEnvelope` schema and per-operation `4xx`/`5xx` responses below);
+    `message` is a human-readable string that MAY change wording over time —
+    integrate against `code`, not `message`.
+
+    ## Two listeners
+
+    This spec documents two distinct HTTP servers this backend runs:
+
+    1. **Main API** (`HTTP_PORT`, default `8080`) — everything under
+       `/api/v1/*`, `/healthz`, and `/internal/*`. This is what admins, the
+       Telegram bot, and `POST /api/v1/nodes/join` (install-node.sh) talk to.
+    2. **Node agent listener** (`NODE_AGENT_PORT`, default `48443`) — `/agent/register`
+       and `/agent/heartbeat` only, served over mTLS by this project's internal
+       CA. `/agent/register` needs no client certificate (the one-time join
+       token IS the credential); `/agent/heartbeat` requires a client
+       certificate issued by a prior `/agent/register` call. OpenAPI 3.0 has
+       no first-class way to express "TLS client certificate required"
+       as a security scheme, so this requirement is called out in each
+       operation's description instead — it is enforced at the TLS layer,
+       before the handler ever runs.
+  version: "1.0.0"
+  contact:
+    name: WGPanel
+servers:
+  - url: /
+    description: >-
+      Main API host. All paths below are absolute (e.g. /api/v1/nodes,
+      /healthz, /internal/admins), matching the real Go net/http mux exactly -
+      there is no shared path prefix across every route.
+  - url: https://node-agent.internal:48443
+    description: >-
+      Node agent mTLS listener (NODE_AGENT_PORT). Separate TLS listener, separate
+      trust root (this project's internal CA) - not reachable through the main
+      API's port or through Caddy's public reverse proxy. Only the /agent/*
+      operations below use this server (see their per-operation `servers`
+      override).
+
+tags:
+  - name: Auth
+    description: Admin login/session management.
+  - name: Nodes
+    description: WireGuard server (node) directory and lifecycle.
+  - name: Accounts
+    description: WireGuard peer provisioning and lifecycle.
+  - name: Subscription
+    description: >-
+      Unauthenticated capability-URL surface for client apps: the per-account
+      subscription token in the path is the credential. Serves the account's
+      current config with steering-based node selection.
+  - name: API Keys
+    description: Bot/reseller credentials for the HMAC-signed integration surface. super_admin only.
+  - name: Admin Users
+    description: Panel operator accounts and roles. super_admin only.
+  - name: Audit Log
+    description: Append-only record of every mutating action. super_admin only.
+  - name: Settings
+    description: Panel-wide configuration and defaults. Readable by any admin, editable by super_admin only.
+  - name: Backup
+    description: >-
+      Whole-panel backup & restore as a single JSON file. super_admin only, both
+      directions audit-logged. The file contains every panel secret except
+      deploy/.env - treat it like the database itself.
+  - name: Health
+    description: Liveness/readiness probes.
+  - name: Node Agent
+    description: >-
+      Endpoints served on the separate mTLS listener (NODE_AGENT_PORT), called by
+      cmd/agent running on each WireGuard node - never called by the admin panel
+      or the Telegram bot directly.
+
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Public liveness probe
+      security: []
+      responses:
+        "200":
+          description: Process is up (does not check DB/Redis - see /internal/healthz for that).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /internal/healthz:
+    get:
+      tags: [Health]
+      summary: Readiness probe (DB + Redis reachability)
+      description: >-
+        Gated by `X-Internal-Token` (must equal the `INTERNAL_API_TOKEN` env var),
+        not by admin/API-key auth. Not reachable from the public internet in the
+        reference deployment (Caddy doesn't proxy `/internal/*`; Docker publishes
+        the API port on `127.0.0.1` only) - but the token is the actual security
+        boundary, since sibling containers on the same network can still reach it.
+      security:
+        - InternalToken: []
+      responses:
+        "200":
+          description: Database and Redis are both reachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+        "503":
+          description: Database or Redis unreachable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  /internal/admins:
+    post:
+      tags: [Admin Users]
+      summary: Create the first super_admin (CLI bootstrap only)
+      description: >-
+        Used by the `wgpanel create-admin` CLI command during installation, not
+        by the frontend. Gated by `X-Internal-Token`. Unlike
+        `POST /api/v1/admins`, this endpoint defaults role to `super_admin` and
+        does not validate the role against an allow-list - it exists purely to
+        create the very first operator before any admin session exists.
+      security:
+        - InternalToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+                role: { type: string, default: super_admin }
+      responses:
+        "201":
+          description: Admin created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminCreateResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409":
+          description: Username already taken.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /internal/nodes/bootstrap-self:
+    post:
+      tags: [Nodes]
+      summary: Create a node and generate its join token in one call (install.sh only)
+      description: >-
+        Used by `install.sh` to self-register the panel's own server as its
+        first WireGuard node (docs/STORY-09-multi-node-accounts.md), combining
+        `POST /api/v1/nodes` + `POST /api/v1/nodes/{id}/join-token` into one
+        install-time convenience call. Gated by `X-Internal-Token`, same trust
+        tier as `/internal/admins`. The resulting node behaves identically to
+        one created through the admin panel - this is not a distinct node type.
+      security:
+        - InternalToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateNodeRequest" }
+      responses:
+        "201":
+          description: Node created and a join token generated for it.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node_id: { type: string, format: uuid }
+                  token: { type: string }
+                  expires_at: { type: string, format: date-time }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409":
+          description: A node with this name already exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in with username/password
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+      responses:
+        "200":
+          description: Authenticated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token: { type: string, description: "JWT, 15 minute TTL" }
+                  refresh_token: { type: string, description: "Redis-backed, 7 day TTL" }
+                  expires_in_seconds: { type: integer, example: 900 }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401":
+          description: Invalid username or password (same response for both cases, to avoid leaking which one was wrong).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Exchange a refresh token for a new access token
+      description: >-
+        Does NOT rotate the refresh token - the same refresh token remains valid
+        and reusable until its own 7-day TTL expires. A rotating-refresh-token
+        design was deliberately deferred (see docs/STORY-06).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "200":
+          description: New access token issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token: { type: string }
+                  expires_in_seconds: { type: integer, example: 900 }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401":
+          description: Refresh token is invalid, expired, or its admin no longer exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/nodes/join:
+    post:
+      tags: [Nodes]
+      summary: Redeem a join token for a plain node record (used by install-node.sh)
+      description: >-
+        Unauthenticated by admin/API-key standards - the one-time join token
+        itself is the credential. Distinct from `/agent/register` on the mTLS
+        listener: this returns a plain `Node` JSON object, not a signed
+        certificate. install-node.sh calls this to confirm the token is valid
+        before handing off to cmd/agent, which then calls `/agent/register`
+        for its actual mTLS identity.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+      responses:
+        "200":
+          description: Token redeemed; node's registration is now marked complete.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Node" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401":
+          description: Join token is invalid, expired, or already used.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/nodes:
+    post:
+      tags: [Nodes]
+      summary: Register a new node
+      description: Requires an admin session with role >= `operator`.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateNodeRequest" }
+      responses:
+        "201":
+          description: Node created (status starts as `pending` until a real agent registers against it).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Node" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: A node with this name already exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    get:
+      tags: [Nodes]
+      summary: List nodes
+      description: >-
+        Admin session (any role) or API key with `read` permission. API-key
+        callers only see nodes in their key's `node_groups` (empty node_groups
+        on the key = unrestricted, sees all).
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nodes:
+                    type: array
+                    items: { $ref: "#/components/schemas/Node" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/nodes/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Nodes]
+      summary: Get a node by id
+      description: 404 if the node exists but is outside an API-key caller's node_groups scope (not 403 - avoids confirming the node's existence to a caller who shouldn't see it).
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Node" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    patch:
+      tags: [Nodes]
+      summary: Update mutable node fields
+      description: >-
+        Admin session with role >= `operator`. All fields optional; only provided
+        fields change. `wg_subnet` is deliberately not editable (peers may already
+        be allocated from it). `region: ""` explicitly clears the steering label.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                node_group: { type: string }
+                region: { type: string }
+                public_endpoint: { type: string }
+                capacity_max_peers: { type: integer, minimum: 1 }
+      responses:
+        "200":
+          description: Updated node.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Node" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: "`node_name_taken`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/nodes/{id}/join-token:
+    post:
+      tags: [Nodes]
+      summary: Generate a one-time join token for a node
+      description: >-
+        Requires an admin session with role = `super_admin` (the highest-privilege
+        node-management action, since a join token lets any holder register as
+        that node's trusted agent). TTL is `NODE_AGENT_JOIN_TOKEN_TTL_MIN`
+        (default 30 minutes).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      security:
+        - BearerAuth: []
+      responses:
+        "201":
+          description: Token generated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  expires_at: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/accounts:
+    post:
+      tags: [Accounts]
+      summary: Create a WireGuard peer account
+      description: >-
+        Admin session (role >= `operator` - `support` is read-only everywhere)
+        or API key with `create` permission. Generates a real WireGuard keypair
+        server-side and gives the account a peer on every currently eligible
+        node (status `registered`/`online`, node_group-restricted for a scoped
+        API key) - not just one. Pass an explicit `node_id` to pin the account
+        to a single node instead of the default fan-out. A node added to the
+        fleet later automatically gets this account backfilled a peer too, the
+        first time that node completes registration. See
+        docs/STORY-09-multi-node-accounts.md for the full design.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateAccountRequest" }
+      responses:
+        "201":
+          description: Account created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: >-
+            Forbidden - either a `support`-role admin session, or an API key
+            without `create` permission, or (`node_group_not_allowed`) an
+            explicit `node_id` outside the API key's `node_groups` scope.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: "`node_not_registered` (an explicit `node_id` hasn't completed agent registration), `node_capacity_exceeded` (that one pinned node has no room), or `no_available_node` (no eligible node had room - the default fan-out only fails entirely when literally zero nodes could be provisioned; a single full node is skipped, not fatal), or `external_ref_taken`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    get:
+      tags: [Accounts]
+      summary: List accounts
+      description: >-
+        Admin session (any role) or API key with `read` permission. API-key
+        callers only ever see accounts under their own key's namespace
+        (`owner_key_namespace`) - admins see every account. `limit` defaults to
+        50, capped at 200.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200, minimum: 1 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accounts:
+                    type: array
+                    items: { $ref: "#/components/schemas/Account" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/accounts/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Accounts]
+      summary: Get an account by id
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    patch:
+      tags: [Accounts]
+      summary: Update mutable account fields
+      description: Admin session (role >= `operator`) or API key with `update` permission. All fields optional; only provided fields change.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label: { type: string }
+                data_quota_gb: { type: number, nullable: true }
+                expiry_at: { type: string, format: date-time, nullable: true }
+                device_limit: { type: integer, nullable: true }
+                bandwidth_limit_mbps:
+                  type: integer
+                  nullable: true
+                  description: 0 removes the limit (unshaped); omitted = unchanged; 1-100000 sets the rate in Mbps.
+                device_limit_hard_enforce:
+                  type: boolean
+                  description: Toggle auto-suspend on device-limit breach (PRD-account-management.md §6.4).
+      responses:
+        "200":
+          description: Updated account.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    delete:
+      tags: [Accounts]
+      summary: Soft-delete an account
+      description: >-
+        Admin session (role >= `operator`) or API key with `delete` permission.
+        Returns the soft-deleted account record (status becomes `deleted`), not
+        an empty 204 - the assigned IP is released after a grace period
+        (`ip_release_at`), not immediately, to avoid immediate reuse collisions.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Account soft-deleted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/accounts/{id}/suspend:
+    post:
+      tags: [Accounts]
+      summary: Suspend an account
+      description: Admin session (role >= `operator`) or API key with `suspend` permission.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  enum: [manual, abuse_flag]
+                  default: manual
+                  description: Any other value is silently coerced to "manual".
+      responses:
+        "200":
+          description: Account suspended.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/accounts/{id}/enable:
+    post:
+      tags: [Accounts]
+      summary: Re-enable a suspended account
+      description: Admin session (role >= `operator`) or API key with `suspend` permission (enable shares the suspend permission, not a separate one).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Account enabled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/accounts/{id}/renew:
+    post:
+      tags: [Accounts]
+      summary: Extend an account's quota and/or expiry
+      description: Admin session (role >= `operator`) or API key with `update` permission.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                add_quota_gb:
+                  type: number
+                  nullable: true
+                  description: Added on top of the existing quota (not a replacement).
+                extend_days:
+                  type: integer
+                  nullable: true
+                  description: Extends from the current expiry_at (or from now, if the account has none/has already expired).
+      responses:
+        "200":
+          description: Account renewed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/accounts/{id}/config:
+    get:
+      tags: [Accounts]
+      summary: Fetch the account's wg-quick configuration file for one of its node peers
+      description: >-
+        Returns `text/plain`, not JSON - a ready-to-import wg-quick config
+        including the account's real (decrypted) private key. An account can
+        have a peer on several nodes (see the `Account.peers` field) - `node_id`
+        picks which one. If omitted and the account has exactly one peer, that
+        peer is used by default; if it has more than one, this 400s with the
+        list of valid node ids instead of guessing. Admin session (any role)
+        or API key with `read` permission.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: node_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+          description: Required if the account has peers on more than one node; optional (defaults to the only peer) otherwise.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: wg-quick config text.
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: |
+                  [Interface]
+                  PrivateKey = <account private key>
+                  Address = 10.66.0.4/32
+
+                  [Peer]
+                  PublicKey = <node public key>
+                  Endpoint = vpn1.example.com:51820
+                  AllowedIPs = 0.0.0.0/0
+                  PersistentKeepalive = 25
+        "400":
+          description: "`node_id_required` - the account has peers on multiple nodes and `node_id` was omitted; the message lists the valid ids."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: "`account_not_found`, or `node_not_found` if `node_id` doesn't match any of this account's peers."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "409":
+          description: "`no_peers` (this account has no node peers yet) or `node_missing_public_key` (the target node has no WireGuard public key recorded yet)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/accounts/{id}/devices:
+    get:
+      tags: [Accounts]
+      summary: List distinct client devices observed for this account
+      description: >-
+        Device tracking per PRD-account-management.md §6.4 - a "device" is a
+        distinct source endpoint (IP:port) reported by node agents from live
+        WireGuard handshakes. `active` = handshaked within the rolling 5-minute
+        window, the same definition device-limit enforcement uses. Rows unseen
+        for 30 days are pruned. Admin session (any role) or API key with `read`
+        permission.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  devices:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, format: uuid }
+                        source_endpoint: { type: string, example: "203.0.113.7:51843" }
+                        node_id: { type: string, format: uuid }
+                        node_name: { type: string }
+                        first_seen_at: { type: string, format: date-time }
+                        last_seen_at: { type: string, format: date-time }
+                        active: { type: boolean }
+                  active_devices: { type: integer }
+                  device_limit: { type: integer, nullable: true }
+                  device_limit_exceeded: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/accounts/{id}/steer:
+    get:
+      tags: [Accounts]
+      summary: Rank this account's nodes, best connection choice first
+      description: >-
+        Smart node steering - scores every node the account has a peer on by
+        current load (active peers / capacity) and recent average CPU, with
+        online nodes always ahead of offline ones and `?region=` matches ahead
+        of the rest. Exactly one entry is `recommended`. This is the same engine
+        the subscription endpoint uses for its default node choice. Admin
+        session (any role) or API key with `read` permission.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: region
+          in: query
+          required: false
+          schema: { type: string }
+          description: Prefer nodes whose region label matches (case-insensitive).
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Nodes ranked best-first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nodes:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        node_id: { type: string, format: uuid }
+                        name: { type: string }
+                        region: { type: string }
+                        public_endpoint: { type: string }
+                        online: { type: boolean }
+                        active_peers: { type: integer }
+                        capacity: { type: integer }
+                        cpu_percent: { type: number, nullable: true, description: Recent average; null when the node has no samples in the window. }
+                        score: { type: number, description: Composite load/CPU score - lower is better. }
+                        region_match: { type: boolean }
+                        recommended: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/accounts/{id}/subscription/rotate:
+    post:
+      tags: [Accounts]
+      summary: Rotate the account's subscription URL
+      description: >-
+        Replaces the subscription token immediately - the old URL stops working,
+        the response carries the account with its new `subscription_path`. The
+        WireGuard keypair is untouched (existing device tunnels keep working;
+        only the config-fetch URL changes). Admin session (role >= `operator`)
+        or API key with `update` permission.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Account with the new subscription_path.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/sub/{token}:
+    get:
+      tags: [Subscription]
+      summary: Fetch the account's current wg-quick config via its subscription URL
+      description: >-
+        Unauthenticated by design - the 192-bit random token in the path is the
+        credential (capability URL), suitable for pasting into client apps that
+        poll for their latest config. By default the best node is chosen by the
+        steering engine; `?node_id=` pins one, `?region=` biases the choice.
+        Suspended/expired accounts get 403 `account_suspended` rather than a
+        config that would silently fail to handshake. The token never appears
+        in access logs (redacted by the logging middleware).
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema: { type: string }
+        - name: node_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+        - name: region
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: wg-quick config text (Content-Disposition attachment).
+          content:
+            text/plain:
+              schema: { type: string }
+        "403":
+          description: "`account_suspended`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "404":
+          description: Unknown token, or `node_not_found` for an explicit `node_id` the account has no peer on.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "409":
+          description: "`no_peers` or `node_missing_public_key`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/sub/{token}/nodes:
+    get:
+      tags: [Subscription]
+      summary: List the nodes available to this subscription, steering-ranked
+      description: >-
+        The machine-readable companion to the config endpoint, for client apps
+        that want to offer a node picker. Same token-as-credential model; each
+        entry carries a ready-to-fetch `config_path`.
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema: { type: string }
+        - name: region
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: Nodes ranked best-first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nodes:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        node_id: { type: string, format: uuid }
+                        name: { type: string }
+                        region: { type: string }
+                        online: { type: boolean }
+                        recommended: { type: boolean }
+                        config_path: { type: string, example: "/api/v1/sub/<token>?node_id=<uuid>" }
+        "403":
+          description: "`account_suspended`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "404":
+          description: Unknown token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/api-keys:
+    post:
+      tags: [API Keys]
+      summary: Create a bot/reseller API key
+      description: >-
+        Requires an admin session with role = `super_admin`. The response's
+        `secret` field is shown **exactly once** - it cannot be retrieved again,
+        only rotated (which invalidates it after a 24h grace period).
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [label]
+              properties:
+                label: { type: string }
+                node_groups:
+                  type: array
+                  items: { type: string }
+                  description: Empty/omitted = unrestricted (all node groups).
+                permissions:
+                  type: array
+                  items:
+                    type: string
+                    enum: [read, create, update, suspend, delete]
+      responses:
+        "201":
+          description: Key created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiKeyCreated" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: "`key_id_collision` - vanishingly rare random-id collision; safe to retry."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    get:
+      tags: [API Keys]
+      summary: List API keys
+      description: Requires an admin session with role = `super_admin`. Never includes secrets.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api_keys:
+                    type: array
+                    items: { $ref: "#/components/schemas/ApiKey" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/api-keys/{id}/revoke:
+    post:
+      tags: [API Keys]
+      summary: Revoke an API key immediately
+      description: Requires an admin session with role = `super_admin`. No grace period - unlike rotation, revocation is immediate.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: revoked }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/api-keys/{id}/rotate:
+    post:
+      tags: [API Keys]
+      summary: Rotate an API key's secret
+      description: >-
+        Requires an admin session with role = `super_admin`. The old secret
+        remains valid for a 24-hour grace period (so in-flight bot deployments
+        don't break instantly), then only the new secret works. The new secret
+        is shown **exactly once**, in this response.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Rotated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiKeyCreated" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/admins:
+    post:
+      tags: [Admin Users]
+      summary: Create an admin/operator/support user
+      description: Requires an admin session with role = `super_admin`.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+                role:
+                  type: string
+                  enum: [super_admin, operator, support]
+                  default: support
+      responses:
+        "201":
+          description: Admin created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminCreateResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: Username already taken.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    get:
+      tags: [Admin Users]
+      summary: List admin users
+      description: Requires an admin session with role = `super_admin`. Never includes password hashes.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  admins:
+                    type: array
+                    items: { $ref: "#/components/schemas/AdminUser" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/audit-log:
+    get:
+      tags: [Audit Log]
+      summary: List recent audit log entries, newest first
+      description: Requires an admin session with role = `super_admin`.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items: { $ref: "#/components/schemas/AuditLogEntry" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /agent/register:
+    servers:
+      - url: https://node-agent.internal:48443
+    post:
+      tags: [Node Agent]
+      summary: Redeem a join token for an mTLS client certificate
+      description: >-
+        Called by `cmd/agent` on first startup. No client certificate is
+        required for this call (it's how the node gets one) - the `join_token`
+        field is the sole credential, single-use, redeemed atomically. The
+        returned certificate's Common Name is always the server-assigned node
+        ID; the CSR's own requested Subject/CN is ignored, so a compromised or
+        buggy agent can never claim a different node's identity.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [join_token, csr_pem]
+              properties:
+                join_token: { type: string }
+                csr_pem:
+                  type: string
+                  description: PEM-encoded PKCS#10 certificate signing request, generated locally by the agent (its private key never leaves the node).
+                wg_public_key:
+                  type: string
+                  description: This node's own WireGuard server public key, if install-node.sh already created a real wg0 interface. Optional.
+      responses:
+        "201":
+          description: Registered. Store the certificate and CA alongside the agent's private key for all future mTLS calls.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node_id: { type: string, format: uuid }
+                  certificate_pem: { type: string }
+                  ca_certificate_pem: { type: string }
+        "400":
+          description: "`invalid_request` (missing fields) or `invalid_csr` (CSR could not be parsed/signed)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "401":
+          description: "`invalid_token` - join token invalid, expired, or already used."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /agent/heartbeat:
+    servers:
+      - url: https://node-agent.internal:48443
+    post:
+      tags: [Node Agent]
+      summary: Report liveness and peer count
+      description: >-
+        Called every 10 seconds by `cmd/agent`. **Requires a client certificate**
+        issued by a prior `/agent/register` call - enforced at the TLS layer
+        (connection-level) and again in-handler (the cert's Subject CN is
+        looked up as the node ID, and its fingerprint must match what was
+        pinned at registration, so a stale-but-still-CA-signed cert from a
+        node that re-registered is correctly rejected). This requirement
+        cannot be expressed as an OpenAPI security scheme in 3.0 - treat it as
+        a hard transport-level precondition, not optional.
+      security: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                peer_count: { type: integer }
+                load_avg: { type: number }
+              description: Informational only - malformed/absent bodies are tolerated, not rejected.
+      responses:
+        "200":
+          description: Heartbeat recorded; node status set to `online`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+        "401":
+          description: "`client_certificate_required` (no client cert presented) or `certificate_superseded` (cert's fingerprint no longer matches this node's pinned identity)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "404":
+          description: "`node_not_found` - certificate's Common Name doesn't match any known node."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/settings:
+    get:
+      tags: [Settings]
+      summary: Get panel-wide settings
+      description: Readable by any admin role (including `support`) - this is configuration display, not a mutating action.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Settings" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    patch:
+      tags: [Settings]
+      summary: Update panel-wide settings
+      description: >-
+        Requires an admin session with role = `super_admin` - these are panel-wide
+        defaults, the same trust tier as API keys and join tokens. Omitted fields are
+        left unchanged (same PATCH convention as `PATCH /api/v1/accounts/{id}` - a
+        nullable field can be set this way but not explicitly cleared back to null,
+        with two exceptions: sub_domain "" and sub_port 0 explicitly clear those).
+        Including panel_domain, sub_domain or sub_port also pushes the new domain
+        config to Caddy live - see domain_live_applied/domain_apply_error on the
+        response.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Settings" }
+      responses:
+        "200":
+          description: Updated settings.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SettingsUpdateResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/backup:
+    post:
+      tags: [Backup]
+      summary: Download a full, password-encrypted panel backup
+      description: >-
+        Requires role = `super_admin`. POST (not GET) because the encryption
+        password rides in the body. Streams a JSON attachment: an argon2id +
+        AES-256-GCM envelope sealing every config table (admins, nodes, accounts,
+        account_peers, account_devices, api_keys, panel_settings, audit_log), the
+        node-mTLS CA keypair, and the deployment's ACCOUNT_KEY_ENCRYPTION_KEY /
+        API_HMAC_MASTER_KEY - so the file plus its password is sufficient to
+        rebuild the panel on a brand-new server with a fresh deploy/.env. Metrics
+        history (TimescaleDB hypertables) is excluded - account usage totals live
+        on the accounts rows and are included. The password is the only way to
+        open the file and cannot be recovered.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string, minLength: 8 }
+      responses:
+        "200":
+          description: The encrypted backup file (Content-Disposition attachment).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BackupEnvelope" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/backup/restore:
+    post:
+      tags: [Backup]
+      summary: Replace ALL panel state with an uploaded backup
+      description: >-
+        Requires role = `super_admin`. Atomically replaces the contents of every
+        backed-up table with the file's rows (a table absent from the file is
+        emptied, not skipped) and writes the CA keypair to disk - if that keypair
+        differs from the running one, node-agent mTLS needs an api restart to pick
+        it up (`restart_required` on the response). If this deployment's
+        ACCOUNT_KEY_ENCRYPTION_KEY / API_HMAC_MASTER_KEY differ from the ones
+        embedded in the backup (disaster recovery onto a fresh .env), every
+        account private key and API-key secret is transparently re-encrypted to
+        the current keys. Validated before anything is touched: the password must
+        open the envelope (`wrong_password`) and the file's schema version must
+        exactly match this panel's (`schema_mismatch`). Restoring replaces admin
+        users too - the caller's own login may change.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password, backup]
+              properties:
+                password: { type: string }
+                backup: { $ref: "#/components/schemas/BackupEnvelope" }
+      responses:
+        "200":
+          description: Restore succeeded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RestoreResult" }
+        "400":
+          description: "`invalid_request` or `wrong_password` - nothing was changed."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: "`schema_mismatch` - nothing was changed."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "413":
+          description: Backup file exceeds the 256MB limit.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Admin session access token from POST /api/v1/auth/login (15 minute TTL).
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: >-
+        Bot/reseller auth. Must be combined with X-Timestamp and X-Signature
+        headers (not separately modelable as OpenAPI security schemes since
+        OpenAPI has no concept of "N headers form one signed credential") -
+        see the top-level description for the exact signing scheme.
+    InternalToken:
+      type: apiKey
+      in: header
+      name: X-Internal-Token
+      description: Must equal the INTERNAL_API_TOKEN env var. Gates every /internal/* route.
+
+  responses:
+    BadRequest:
+      description: "`invalid_request` - malformed JSON body or missing/invalid required fields."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Unauthorized:
+      description: >-
+        Missing/invalid/expired bearer token, or missing/invalid API-key
+        headers, or (for API keys) `stale_timestamp`/`invalid_timestamp`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Forbidden:
+      description: >-
+        `forbidden` - authenticated but not permitted: a `support`-role admin
+        attempting a write, an admin below the operation's minimum role, or an
+        API key missing the required permission.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    NotFound:
+      description: No resource with that id (or, for API-key callers, one outside their scope - returned as 404 rather than 403 to avoid confirming existence).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    InternalError:
+      description: "`internal_error` - unexpected server-side failure."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              description: >-
+                Stable machine-readable identifier. Known values include:
+                invalid_request, invalid_csr, invalid_credentials,
+                invalid_refresh_token, invalid_token, client_certificate_required,
+                certificate_superseded, unauthorized, invalid_timestamp,
+                stale_timestamp, forbidden, node_group_not_allowed, node_not_found,
+                account_not_found, api_key_not_found, node_not_registered,
+                node_capacity_exceeded, no_available_node, external_ref_taken,
+                node_missing_public_key, username_taken, key_id_collision,
+                node_name_taken, not_ready, internal_error.
+            message:
+              type: string
+              description: Human-readable; may change wording - do not match against this.
+      required: [error]
+
+    Node:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        node_group: { type: string, example: default }
+        region:
+          type: string
+          example: eu
+          description: Free-form steering label; "" = unassigned. Subscription/steer requests carrying ?region= prefer nodes whose region matches (case-insensitive).
+        public_endpoint: { type: string, example: "vpn1.example.com:51820" }
+        wg_subnet: { type: string, example: "10.66.0.0/24" }
+        capacity_max_peers: { type: integer, example: 250 }
+        status:
+          type: string
+          enum: [pending, registered, online, offline]
+          description: >-
+            pending = created, no join token redeemed yet. registered =
+            join token redeemed, agent hasn't sent a heartbeat yet. online =
+            agent is sending heartbeats. offline = no heartbeat within the
+            stale threshold. Account creation accepts registered or online.
+        public_key:
+          type: string
+          nullable: true
+          description: Set once the node's agent reports its own WireGuard server public key.
+        created_at: { type: string, format: date-time }
+      required: [id, name, node_group, public_endpoint, wg_subnet, capacity_max_peers, status, created_at]
+
+    CreateNodeRequest:
+      type: object
+      required: [name, public_endpoint, wg_subnet]
+      properties:
+        name: { type: string }
+        node_group: { type: string, default: default }
+        region: { type: string, default: "", description: Optional steering label, e.g. "eu" or "us-east". }
+        public_endpoint: { type: string, example: "vpn1.example.com:51820" }
+        wg_subnet: { type: string, example: "10.66.0.0/24" }
+        capacity_max_peers: { type: integer, default: 250 }
+        public_key:
+          type: string
+          nullable: true
+          description: Usually left unset at creation time and filled in later by the agent's first registration.
+
+    Account:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        external_ref:
+          type: string
+          nullable: true
+          description: Caller-supplied idempotency/reference key (e.g. the bot's own user/order id). Unique when set.
+        label: { type: string }
+        public_key: { type: string, description: "This account's WireGuard public key, shared across every node it has a peer on (private key is never returned except via GET .../config)." }
+        peers:
+          type: array
+          description: >-
+            Every node this account currently has a WireGuard peer on (see
+            docs/STORY-09-multi-node-accounts.md) - typically every eligible
+            node in the fleet, unless the account was pinned to one at creation.
+          items: { $ref: "#/components/schemas/AccountPeer" }
+        data_quota_bytes: { type: integer, format: int64, nullable: true, description: null = unlimited }
+        data_used_bytes: { type: integer, format: int64 }
+        expiry_at: { type: string, format: date-time, nullable: true, description: null = never expires }
+        device_limit: { type: integer, nullable: true, description: null = unlimited }
+        device_limit_exceeded:
+          type: boolean
+          description: >-
+            True while distinct active source endpoints (rolling 5-minute window)
+            exceed device_limit - a detection signal, not a cutoff, unless
+            device_limit_hard_enforce is on. Cleared automatically once back under.
+        device_limit_hard_enforce:
+          type: boolean
+          description: When true, exceeding the device limit auto-suspends the account (suspend_reason = device_limit) instead of only flagging it.
+        bandwidth_limit_mbps:
+          type: integer
+          nullable: true
+          description: Per-account rate limit enforced by every node agent via tc; null = unshaped.
+        subscription_path:
+          type: string
+          example: /api/v1/sub/0a1b2c...
+          description: >-
+            Relative capability URL serving this account's current wg-quick config
+            with no further authentication - prepend the panel's public origin.
+            Rotate via POST .../subscription/rotate if it leaks.
+        subscription_url:
+          type: string
+          nullable: true
+          example: https://sub.example.com:8443/api/v1/sub/0a1b2c...
+          description: >-
+            Absolute form of subscription_path on the separate subscription origin
+            (Settings' sub_domain/sub_port), or null when no separate origin is
+            configured - fall back to prepending the panel's own origin to
+            subscription_path, as before.
+        status:
+          type: string
+          enum: [active, suspended, deleted]
+        suspend_reason:
+          type: string
+          nullable: true
+          enum: [manual, abuse_flag, expired, quota_exceeded, device_limit]
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        node_id:
+          type: string
+          format: uuid
+          nullable: true
+          deprecated: true
+          description: Deprecated - mirrors peers[0].node_id, or null if the account has no peers yet. Use peers instead. Kept for one release as a bot-integration compatibility bridge from the pre-multi-node model.
+        assigned_ip:
+          type: string
+          nullable: true
+          deprecated: true
+          description: Deprecated - mirrors peers[0].assigned_ip. Use peers instead.
+      required: [id, label, public_key, peers, data_used_bytes, status, created_at, updated_at]
+
+    AccountPeer:
+      type: object
+      properties:
+        node_id: { type: string, format: uuid }
+        node_name: { type: string }
+        assigned_ip: { type: string, example: "10.66.0.4" }
+      required: [node_id, node_name, assigned_ip]
+
+    CreateAccountRequest:
+      type: object
+      required: [label]
+      properties:
+        external_ref: { type: string, nullable: true }
+        label: { type: string }
+        node_id:
+          type: string
+          nullable: true
+          description: >-
+            Omit (or send "auto") to give the account a peer on every currently
+            eligible node - the default and recommended behavior. Pass a
+            specific node UUID to pin the account to just that one node instead.
+        data_quota_gb: { type: number, nullable: true }
+        expiry_at: { type: string, format: date-time, nullable: true }
+        device_limit: { type: integer, nullable: true }
+        bandwidth_limit_mbps: { type: integer, nullable: true, minimum: 1, maximum: 100000, description: Omit/null = unshaped. }
+
+    ApiKey:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        key_id: { type: string, description: "Public identifier - this is the value sent as X-API-Key." }
+        label: { type: string }
+        node_groups:
+          type: array
+          items: { type: string }
+          description: Empty = unrestricted.
+        permissions:
+          type: array
+          items:
+            type: string
+            enum: [read, create, update, suspend, delete]
+        revoked: { type: boolean }
+        created_at: { type: string, format: date-time }
+      required: [id, key_id, label, node_groups, permissions, revoked, created_at]
+
+    ApiKeyCreated:
+      allOf:
+        - $ref: "#/components/schemas/ApiKey"
+        - type: object
+          properties:
+            secret:
+              type: string
+              description: Shown exactly once - store it now, it cannot be retrieved again (only rotated).
+          required: [secret]
+
+    AdminUser:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+        role:
+          type: string
+          enum: [super_admin, operator, support]
+        created_at: { type: string, format: date-time }
+      required: [id, username, role, created_at]
+
+    AdminCreateResponse:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+        role: { type: string, enum: [super_admin, operator, support] }
+      required: [id, username, role]
+
+    AuditLogEntry:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        actor:
+          type: string
+          description: Admin username, "node-agent" for agent-originated events, or the API key's label for bot-originated events.
+        action: { type: string, example: account.suspended }
+        target: { type: string, nullable: true, description: Usually the affected resource's id. }
+        detail:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Free-form JSON, action-specific (e.g. {"reason":"manual"}).
+        ip_address: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+      required: [id, actor, action, created_at]
+
+    Settings:
+      type: object
+      properties:
+        public_base_url:
+          type: string
+          nullable: true
+          description: >-
+            The domain this panel is served on (e.g. "https://panel.example.com").
+            Informational only - editing this does not move DNS/TLS, which is still
+            configured via deploy/.env's PANEL_DOMAIN and requires a redeploy.
+        default_data_quota_gb:
+          type: number
+          nullable: true
+          description: Pre-fills the admin panel's "New account" dialog quota field. null = no default (unlimited).
+        default_device_limit:
+          type: integer
+          nullable: true
+          description: Pre-fills the admin panel's "New account" dialog device-limit field. null = no default (unlimited).
+        default_node_capacity:
+          type: integer
+          description: Pre-fills the admin panel's "New node" dialog capacity field.
+        support_contact:
+          type: string
+          nullable: true
+          description: Shown to other admins who need help (e.g. an email address or Telegram handle).
+        panel_domain:
+          type: string
+          nullable: true
+          example: panel.example.com
+          description: >-
+            The live-managed TLS domain Caddy serves the panel on (unlike
+            public_base_url, which is informational only). Setting it via PATCH
+            persists it AND pushes it to Caddy's admin API live - see
+            domain_live_applied/domain_apply_error on the PATCH response. null =
+            never set from the panel; Caddy runs the .env PANEL_DOMAIN it booted with.
+        client_dns:
+          type: string
+          example: "1.1.1.1, 1.0.0.1"
+          description: >-
+            The DNS = line written into every generated wg-quick config
+            (comma-separated). Takes effect on the next config download.
+        sub_domain:
+          type: string
+          nullable: true
+          example: sub.example.com
+          description: >-
+            Optional separate domain for subscription URLs. When set, Caddy serves
+            ONLY /api/v1/sub/* on it (with its own automatic certificate) and
+            account responses carry an absolute subscription_url built from it.
+            Live-pushed like panel_domain. On PATCH, "" explicitly clears it back
+            to off (unlike other nullable settings, which can't be cleared).
+        sub_port:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 65535
+          description: >-
+            Public HTTPS port for the subscription origin. null = 443 (shares the
+            panel's port via SNI, no extra setup). Any other port must match the
+            SUB_PORT published in deploy/.env. On PATCH, 0 explicitly resets to
+            the default.
+      required: [default_node_capacity, client_dns]
+
+    BackupEnvelope:
+      type: object
+      description: >-
+        The wgpanel-backup-enc/1 format: an argon2id + AES-256-GCM envelope. Only
+        format and created_at are readable without the password. `kdf` carries the
+        argon2id parameters the file was sealed with (salt base64, t/m/p costs);
+        `data` is the base64 ciphertext of the backup payload - config tables as
+        json_agg rows, the CA keypair (PEM), the applied-migrations list (restore
+        requires an exact match), and the deployment's encryption keys.
+      required: [format, created_at, kdf, nonce, data]
+      properties:
+        format: { type: string, enum: [wgpanel-backup-enc/1] }
+        created_at: { type: string, format: date-time }
+        kdf:
+          type: object
+          required: [salt, t, m, p]
+          properties:
+            salt: { type: string, description: base64 (raw, unpadded) }
+            t: { type: integer }
+            m: { type: integer, description: memory cost in KB }
+            p: { type: integer }
+        nonce: { type: string, description: base64 (raw, unpadded) }
+        data: { type: string, description: base64 (raw, unpadded) AES-256-GCM ciphertext }
+
+    RestoreResult:
+      type: object
+      required: [restored, ca_restored, restart_required]
+      properties:
+        restored:
+          type: object
+          additionalProperties: { type: integer }
+          description: Rows restored per table.
+        ca_restored:
+          type: boolean
+          description: The backup carried a CA keypair and it was written to disk.
+        restart_required:
+          type: boolean
+          description: >-
+            The restored CA differs from the one loaded at startup - node-agent
+            mTLS keeps using the old CA until the api container is restarted.
+
+    SettingsUpdateResult:
+      allOf:
+        - $ref: "#/components/schemas/Settings"
+        - type: object
+          properties:
+            domain_live_applied:
+              type: boolean
+              description: >-
+                Only meaningful when the request included panel_domain, sub_domain
+                or sub_port: true when the new config was pushed to Caddy live.
+            domain_apply_error:
+              type: string
+              nullable: true
+              description: >-
+                Why the live push failed, if it did. The values are still persisted
+                either way; the API re-applies them from the database on its next
+                startup.

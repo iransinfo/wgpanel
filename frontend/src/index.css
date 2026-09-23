@@ -1,0 +1,104 @@
+@import "tailwindcss";
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+
+/* Dark mode is toggled by putting .dark on <html> (see index.html init script
+   and lib/theme.ts) instead of following the OS unconditionally, so the user
+   can pick light / dark / system from the sidebar. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --animate-backdrop-in: backdrop-in 0.15s ease-out both;
+  --animate-dialog-in: dialog-in 0.22s cubic-bezier(0.16, 1, 0.3, 1) both;
+  --animate-toast-in: toast-in 0.28s cubic-bezier(0.21, 1.02, 0.73, 1) both;
+
+  @keyframes backdrop-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes dialog-in {
+    from { opacity: 0; transform: translateY(10px) scale(0.97); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateY(12px) scale(0.96); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+}
+
+/* Semantic surfaces/text/accent - single source of truth for both themes.
+   Utilities like bg-surface / text-muted / border-edge compile straight to
+   these vars ("inline"), so flipping .dark restyles everything at runtime. */
+@theme inline {
+  --color-bg: var(--ui-bg);
+  --color-surface: var(--ui-surface);
+  --color-inset: var(--ui-inset);
+  --color-edge: var(--ui-edge);
+  --color-edge-strong: var(--ui-edge-strong);
+  --color-fg: var(--ui-fg);
+  --color-muted: var(--ui-muted);
+  --color-faint: var(--ui-faint);
+  --color-accent: var(--ui-accent);
+  --color-accent-hover: var(--ui-accent-hover);
+  --color-accent-soft: var(--ui-accent-soft);
+  --color-accent-fg: var(--ui-accent-fg);
+}
+
+:root {
+  color-scheme: light;
+  --ui-bg: #f7f8fa;
+  --ui-surface: #ffffff;
+  --ui-inset: #f1f3f7;
+  --ui-edge: #e6e9f0;
+  --ui-edge-strong: #d3d8e2;
+  --ui-fg: #191e2b;
+  --ui-muted: #5c6474;
+  --ui-faint: #8d94a3;
+  --ui-accent: #4f46e5;
+  --ui-accent-hover: #4338ca;
+  --ui-accent-soft: #eef0fd;
+  --ui-accent-fg: #4338ca;
+}
+
+.dark {
+  color-scheme: dark;
+  --ui-bg: #0b0d13;
+  --ui-surface: #12151d;
+  --ui-inset: #1a1e29;
+  --ui-edge: #242a3a;
+  --ui-edge-strong: #333b52;
+  --ui-fg: #e8eaf1;
+  --ui-muted: #9aa1b3;
+  --ui-faint: #656d81;
+  --ui-accent: #6366f1;
+  --ui-accent-hover: #7c7ff4;
+  --ui-accent-soft: #26294b;
+  --ui-accent-fg: #a5b4fc;
+}
+
+body {
+  margin: 0;
+  background-color: var(--ui-bg);
+  color: var(--ui-fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--ui-accent);
+}
+
+::selection {
+  background: color-mix(in srgb, var(--ui-accent) 25%, transparent);
+}
+
+/* Slim, theme-aware scrollbars for the in-panel scroll areas. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--ui-edge-strong) transparent;
+}
