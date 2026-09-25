@@ -22,7 +22,7 @@ SCRIPT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # the same repo/branch into a temp dir, repointing SCRIPT_SOURCE_DIR there - a real
 # bug hit verifying the README's own instructions on a fresh server, not a
 # hypothetical.
-REPO_RAW_BASE="https://raw.githubusercontent.com/iransinfo/WGPanel/main/deploy"
+REPO_RAW_BASE="https://raw.githubusercontent.com/iransinfo/wgpanel/main/deploy"
 DEPLOY_COMPANION_FILES=(docker-compose.yml Caddyfile .env.example wgpanel)
 
 # The panel's own server can optionally run as this WGPanel's first WireGuard node,
@@ -31,7 +31,7 @@ DEPLOY_COMPANION_FILES=(docker-compose.yml Caddyfile .env.example wgpanel)
 NODE_DIR="/opt/wgpanel-node"
 NODE_COMPOSE_FILE="$NODE_DIR/docker-compose.yml"
 NODE_ENV_FILE="$NODE_DIR/.env"
-WGPANEL_REPO_URL="${WGPANEL_REPO_URL:-https://github.com/iransinfo/WGPanel.git}"
+WGPANEL_REPO_URL="${WGPANEL_REPO_URL:-https://github.com/iransinfo/wgpanel.git}"
 
 log()  { echo -e "\033[1;32m[wgpanel]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[wgpanel]\033[0m $*"; }
