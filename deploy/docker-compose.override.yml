@@ -1,0 +1,64 @@
+# Dev-only overrides, auto-merged by `docker compose` ONLY when run from this repo's
+# deploy/ dir (Compose loads docker-compose.override.yml automatically if present).
+# A production host installs docker-compose.yml alone (install.sh copies just that
+# file), so none of the below - local image builds or the in-Docker WireGuard test
+# node - ever reaches production. Keeping them here instead of in the base file is
+# what makes the base file genuinely production-only.
+
+name: wgpanel
+
+services:
+  # Build the api/frontend images from local source instead of pulling the published
+  # ones - so `docker compose up --build` (or `docker compose build`) reflects
+  # uncommitted changes during development and the e2e smoke test. Production pulls
+  # API_IMAGE/FRONTEND_IMAGE from the registry and never builds.
+  api:
+    build: ../backend
+    pull_policy: build
+
+  frontend:
+    build: ../frontend
+    pull_policy: build
+
+  # Dev-only WireGuard node running INSIDE Docker, for hosts (e.g. macOS) where
+  # install-node.sh can't run directly - it depends on apt/systemd/ufw and real
+  # iptables, none of which exist on the bare host there. Off by default; start with
+  # `docker compose --profile node up -d wg-node` after generating a join token from
+  # Nodes -> Add Node in the panel and setting NODE_JOIN_TOKEN in .env. Not for
+  # production node deployment - use install-node.sh on a real Linux host for that.
+  wg-node:
+    profiles: ["node"]
+    build:
+      context: ..
+      dockerfile: deploy/node.Dockerfile
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    depends_on:
+      api:
+        condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      - net.ipv4.ip_forward=1
+    environment:
+      WGPANEL_PANEL_ADDR: api:${NODE_AGENT_PORT}
+      WGPANEL_JOIN_TOKEN: ${NODE_JOIN_TOKEN}
+      WGPANEL_NODE_NAME: ${NODE_NAME:-dev-docker-node}
+      WGPANEL_WG_INTERFACE: ${NODE_WG_IFACE:-wg0}
+      WGPANEL_WG_PORT: ${NODE_WG_PORT:-51820}
+      WG_IFACE_ADDR: ${NODE_WG_IFACE_ADDR:-10.66.0.1/24}
+    ports:
+      - "${NODE_WG_PORT:-51820}:${NODE_WG_PORT:-51820}/udp"
+    volumes:
+      - wgpanel_node_state:/etc/wireguard
+      - wgpanel_node_agent_state:/etc/wgpanel/state
+
+volumes:
+  wgpanel_node_state:
+  wgpanel_node_agent_state:
