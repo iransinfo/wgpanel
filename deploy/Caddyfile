@@ -1,0 +1,54 @@
+{
+	# docs/STORY-10-monitoring-and-domain-management.md, Part 2 - a Unix socket, not
+	# the TCP default (0.0.0.0:2019), since the admin API has no authentication of its
+	# own; a socket shared only with the api container (see docker-compose.yml's
+	# wgpanel_caddy_admin volume) scopes reachability instead of exposing full
+	# reverse-proxy reconfiguration (and TLS private key readback) to every container
+	# on the compose network. This boot-time config is only the starting point - the
+	# panel's Settings page pushes a live replacement of this whole block via
+	# POST /load whenever the domain is changed from the UI, no restart needed.
+	# |0666 - Caddy runs as root (needed to bind :80/:443) but the api container runs
+	# as a non-root distroless user (UID 65532, a different UID/GID namespace
+	# entirely) - without an explicit mode the socket defaults to owner-only and
+	# api's dial fails with "permission denied" (found while verifying this against
+	# real containers, not just `caddy adapt`, which doesn't catch this). The real
+	# access boundary here is the volume mount itself - this socket file only ever
+	# reaches the api and caddy containers (see docker-compose.yml's
+	# wgpanel_caddy_admin volume, never mounted into frontend), so a permissive mode
+	# within that shared volume doesn't widen who can actually reach it.
+	admin unix//admin/caddy-admin.sock|0666
+}
+
+{$PANEL_DOMAIN} {
+	# `tls <email>` (not the bare `email` directive, which Caddy v2.10 doesn't
+	# recognize at the site-block level - confirmed via `caddy adapt`, a real bug
+	# found while verifying docs/STORY-10-monitoring-and-domain-management.md that
+	# had been crash-looping this container the whole project, previously
+	# mis-attributed to "no real domain configured in dev").
+	tls {$ADMIN_ACL_EMAIL}
+
+	# Admin/reseller & Telegram-bot facing API. `handle` (not `handle_path`) -
+	# handle_path strips the matched /api prefix before forwarding, but the Go API's
+	# own routes are registered WITH the /api prefix (e.g. POST /api/v1/auth/login -
+	# see backend/internal/httpapi/server.go), so a stripped request arrived at the
+	# backend as /v1/auth/login and 404'd. Never caught earlier because every test
+	# in this project talked to the API directly (127.0.0.1:8090 or api:8080 inside
+	# the compose network) - this is the first real request that ever went through
+	# Caddy's actual domain routing end-to-end.
+	handle /api/* {
+		reverse_proxy api:8080
+	}
+
+	# Admin panel SPA
+	handle {
+		reverse_proxy frontend:80
+	}
+}
+
+# Note: there is deliberately NO site block here for the separate subscription
+# domain (Settings -> Subscription domain & port). That config lives only in the
+# database (panel_settings.sub_domain/sub_port) and is pushed live through the admin
+# socket - both on settings changes and by the api on every startup
+# (httpapi.ReapplyDomainConfig), since Caddy always boots from this static file. An
+# env-templated block can't work here: Caddyfile syntax has no conditionals, and an
+# empty site address (the feature-off case) is a config error.
