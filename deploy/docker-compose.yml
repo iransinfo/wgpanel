@@ -1,0 +1,38 @@
+services:
+  timescale:
+    image: timescale/timescaledb@sha256:ba149561ad4ddff5940d6eb0a0df60aefd1355cee1a450928f271267038fc888
+    restart: always
+    volumes:
+      - ./data/timescale:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine@sha256:ee64a64eaab618d88051c3ade8f6352d11531fcf79d9a4818b9b183d8c1d18ba
+    restart: always
+
+  api:
+    image: ghcr.io/iransinfo/wgpanel-api:latest
+    restart: always
+    environment:
+      - DATABASE_URL=GAPGPTMASKTOKENewl5e2nystnX0X}:GAPGPTMASKTOKENewl5e2nystnX1X@timescale:5432/wgpanel
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET}
+    depends_on:
+      - timescale
+      - redis
+
+  frontend:
+    image: ghcr.io/iransinfo/wgpanel-frontend:latest
+    restart: always
+    depends_on:
+      - api
+
+  caddy:
+    image: caddy:2-alpine@sha256:e2e3a089760c453bc51c4e718342bd7032d6714f15b437db7121bfc2de2654a6
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - ./data/caddy_data:/data
+      - ./data/caddy_config:/config
